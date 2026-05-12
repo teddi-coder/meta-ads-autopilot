@@ -1,12 +1,9 @@
 FROM python:3.11-slim
 
-# Install system dependencies + Node.js for supergateway
+# Install system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc nodejs npm && \
+    apt-get install -y --no-install-recommends gcc && \
     rm -rf /var/lib/apt/lists/*
-
-# Install supergateway (wraps stdio MCP as HTTP/SSE server)
-RUN npm install -g supergateway
 
 # Set working directory
 WORKDIR /app
@@ -26,5 +23,5 @@ COPY . .
 
 EXPOSE 8000
 
-# Wrap the stdio MCP server with supergateway so it binds to HTTP 0.0.0.0:8000
-CMD ["supergateway", "--stdio", "python -m meta_ads_mcp", "--port", "8000", "--host", "0.0.0.0"]
+# Run the streamable-HTTP MCP server directly (serves /mcp on port 8000)
+CMD ["python", "-m", "meta_ads_mcp"]
