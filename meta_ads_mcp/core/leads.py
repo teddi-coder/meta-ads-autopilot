@@ -201,11 +201,11 @@ async def get_form_leads(
 
         if "leads_retrieval" in msg.lower() or code in (200, 10, 190):
             return json.dumps({
-                "error": msg,
-                "permissions_note": (
-                    "This endpoint requires 'leads_retrieval' permission. "
-                    "The current access token may not have this scope. "
-                    "Regenerate the token with leads_retrieval + pages_read_engagement."
+                "error": (
+                    "Permission error: get_form_leads requires the 'leads_retrieval' permission "
+                    "on the Meta app. To fix: log into Meta developer portal → App Review → "
+                    "Permissions and Features → request 'leads_retrieval' Advanced Access. "
+                    f"(Raw API error: {msg})"
                 ),
             }, indent=2)
 

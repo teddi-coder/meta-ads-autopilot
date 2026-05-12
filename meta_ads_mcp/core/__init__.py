@@ -7,7 +7,7 @@ from .adsets import get_adsets, get_adset_details, update_adset
 from .ads import get_ads, get_ad_details, get_creative_details, get_ad_creatives, get_ad_image, update_ad
 from .insights import get_insights
 from . import authentication  # Import module to register conditional auth tools
-from .server import main
+from .server import login_cli, main
 from . import ads_library
 from .budget_schedules import create_budget_schedule
 from .targeting import search_interests, get_interest_suggestions, estimate_audience_size, search_behaviors, search_demographics, search_geo_locations
@@ -32,6 +32,7 @@ __all__ = [
     'get_ad_image',
     'update_ad',
     'get_insights',
+    'login_cli',
     'main',
     'create_budget_schedule',
     'search_interests',
