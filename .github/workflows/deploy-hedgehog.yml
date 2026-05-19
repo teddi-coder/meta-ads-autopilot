@@ -1,0 +1,31 @@
+name: "Deploy: hedgehog-meta-ads to Fly.io"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "hedgehog_meta.py"
+      - "hedgehog_meta_writer.py"
+      - "Dockerfile"
+      - "fly.toml"
+      - "pyproject.toml"
+      - "uv.lock"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Fly.io
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        run: flyctl deploy --app hedgehog-meta-ads --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
