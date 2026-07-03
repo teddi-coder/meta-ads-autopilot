@@ -1201,6 +1201,9 @@ async def create_ad_creative(
     images: Optional[List[Dict[str, Any]]] = None,
     facebook_branded_content: Optional[Dict[str, Any]] = None,
     instagram_branded_content: Optional[Dict[str, Any]] = None,
+    carousel_cards: Optional[List[Dict[str, Any]]] = None,
+    multi_share_end_card: bool = False,
+    multi_share_optimized: bool = False,
 ) -> str:
     """Create a new ad creative using an uploaded image hash, video ID, or an existing post.
 
@@ -1247,6 +1250,13 @@ async def create_ad_creative(
         images: List of image objects for placement asset customization
         facebook_branded_content: Facebook partnership ad settings {"sponsor_page_id": "<page_id>"}
         instagram_branded_content: Instagram partnership ad settings {"sponsor_id": "<ig_user_id>"}
+        carousel_cards: List of card dicts for classic carousel (child_attachments). Each card:
+            {"image_hash": str (required), "name": str (required), "link": str (required),
+             "description": str (optional), "call_to_action_type": str (optional, default LEARN_MORE)}.
+            Mutually exclusive with image_hash, image_hashes, images, and video_id. Requires 2–10 cards,
+            page_id, and link_url. Preserves card order exactly as supplied.
+        multi_share_end_card: Show an end card in the carousel (default False).
+        multi_share_optimized: Allow Meta to reorder cards (default False).
     """
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
@@ -1318,6 +1328,13 @@ async def create_ad_creative(
                 images = _p
         except (json.JSONDecodeError, TypeError):
             pass
+    if isinstance(carousel_cards, str):
+        try:
+            _p = json.loads(carousel_cards)
+            if isinstance(_p, list):
+                carousel_cards = _p
+        except (json.JSONDecodeError, TypeError):
+            pass
     if isinstance(facebook_branded_content, str):
         try:
             _p = json.loads(facebook_branded_content)
@@ -1355,12 +1372,24 @@ async def create_ad_creative(
             except (json.JSONDecodeError, TypeError):
                 pass
 
+    # Validate carousel_cards mutual exclusivity and requirements
+    if carousel_cards is not None:
+        conflicting = [p for p, v in [("image_hash", image_hash), ("image_hashes", image_hashes), ("images", images), ("video_id", video_id)] if v]
+        if conflicting:
+            return json.dumps({"error": f"carousel_cards is mutually exclusive with: {', '.join(conflicting)}. Remove those params."}, indent=2)
+        if len(carousel_cards) < 2 or len(carousel_cards) > 10:
+            return json.dumps({"error": f"carousel_cards requires between 2 and 10 cards inclusive (got {len(carousel_cards)})."}, indent=2)
+        if not page_id:
+            return json.dumps({"error": "page_id is required when using carousel_cards."}, indent=2)
+        if not link_url:
+            return json.dumps({"error": "link_url is required when using carousel_cards."}, indent=2)
+
     # Validate media mutual exclusivity
     media_params = sum(1 for x in [image_hash, image_hashes, video_id, videos, images] if x)
     if media_params > 1:
         return json.dumps({"error": "Only one media source allowed: image_hash, image_hashes, video_id, videos, or images."}, indent=2)
-    if media_params == 0 and not object_story_id:
-        return json.dumps({"error": "No media provided. Specify image_hash, image_hashes, video_id, videos, images, or object_story_id."}, indent=2)
+    if media_params == 0 and not object_story_id and carousel_cards is None:
+        return json.dumps({"error": "No media provided. Specify image_hash, image_hashes, video_id, videos, images, carousel_cards, or object_story_id."}, indent=2)
 
     if image_hashes and len(image_hashes) > 10:
         return json.dumps({"error": "Maximum 10 image hashes allowed for FLEX creatives"}, indent=2)
@@ -1626,6 +1655,32 @@ async def create_ad_creative(
                         cta2["value"] = cta_value2
                     link_data["call_to_action"] = cta2
                 creative_data["object_story_spec"] = {"page_id": page_id, "link_data": link_data}
+
+        elif carousel_cards is not None:
+            child_attachments: List[Dict[str, Any]] = []
+            for card in carousel_cards:
+                attachment: Dict[str, Any] = {
+                    "link": card["link"],
+                    "image_hash": card["image_hash"],
+                    "name": card["name"],
+                }
+                if "description" in card and card["description"]:
+                    attachment["description"] = card["description"]
+                card_cta_type = card.get("call_to_action_type", "LEARN_MORE")
+                attachment["call_to_action"] = {"type": card_cta_type, "value": {"link": card["link"]}}
+                child_attachments.append(attachment)
+
+            carousel_cta_type = call_to_action_type or "SEE_DETAILS"
+            carousel_link_data: Dict[str, Any] = {
+                "link": link_url,
+                "call_to_action": {"type": carousel_cta_type, "value": {"link": link_url}},
+                "child_attachments": child_attachments,
+                "multi_share_end_card": multi_share_end_card,
+                "multi_share_optimized": multi_share_optimized,
+            }
+            if message:
+                carousel_link_data["message"] = message
+            creative_data["object_story_spec"] = {"page_id": page_id, "link_data": carousel_link_data}
 
         else:
             if is_video:
