@@ -8,6 +8,9 @@ import httpx
 import asyncio
 import functools
 import os
+import random
+import re
+import time
 from . import auth
 from .auth import needs_authentication, auth_manager, start_callback_server, shutdown_callback_server
 from .utils import logger
@@ -41,6 +44,31 @@ logger.info(f"Graph API Version: {META_GRAPH_API_VERSION}")
 logger.info(f"META_APP_ID env var present: {'Yes' if os.environ.get('META_APP_ID') else 'No'}")
 logger.info(f"META_APP_SECRET env var present (appsecret_proof will be {'enabled' if os.environ.get('META_APP_SECRET') else 'disabled'})")
 
+# Rate-limit error codes per Meta's error reference — retry with backoff on these
+_RATE_LIMIT_CODES = frozenset({4, 17, 32, 613})
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 2.0  # seconds; doubles per attempt
+
+# Proactive throttle: account_id → monotonic timestamp to delay until
+_account_throttle_until: Dict[str, float] = {}
+_THROTTLE_DELAY = 5.0  # seconds to wait when usage header reports >= 80%
+
+# In-memory outcome counter; logged after every call for observability
+_outcome_counts: Dict[str, int] = {
+    "success": 0,
+    "rate_limited_retried_success": 0,
+    "rate_limited_exhausted": 0,
+    "auth_error": 0,
+    "malformed_request": 0,
+    "other_error": 0,
+}
+
+
+def _record_outcome(outcome: str) -> None:
+    """Increment the outcome counter and log current totals."""
+    _outcome_counts[outcome] = _outcome_counts.get(outcome, 0) + 1
+    logger.info(f"api_outcome outcome={outcome} totals={_outcome_counts}")
+
 class GraphAPIError(Exception):
     """Exception raised for errors from the Graph API."""
     def __init__(self, error_data: Dict[str, Any]):
@@ -61,40 +89,60 @@ class GraphAPIError(Exception):
 
 
 def _log_meta_rate_limit_headers(headers: dict, endpoint: str) -> None:
-    """Log Meta's rate limit headers for observability (X-App-Usage, X-Business-Use-Case-Usage)."""
+    """Log Meta's rate limit headers and set proactive throttle for high-usage accounts."""
     app_usage = headers.get("x-app-usage")
     biz_usage = headers.get("x-business-use-case-usage")
     ad_account_usage = headers.get("x-ad-account-usage")
 
-    if app_usage or biz_usage or ad_account_usage:
-        usage_data = {}
-        if app_usage:
-            try:
-                usage_data["app_usage"] = json.loads(app_usage)
-            except (json.JSONDecodeError, TypeError):
-                usage_data["app_usage_raw"] = str(app_usage)
-        if biz_usage:
-            try:
-                usage_data["business_use_case_usage"] = json.loads(biz_usage)
-            except (json.JSONDecodeError, TypeError):
-                usage_data["business_use_case_usage_raw"] = str(biz_usage)
-        if ad_account_usage:
-            try:
-                usage_data["ad_account_usage"] = json.loads(ad_account_usage)
-            except (json.JSONDecodeError, TypeError):
-                usage_data["ad_account_usage_raw"] = str(ad_account_usage)
+    if not (app_usage or biz_usage or ad_account_usage):
+        return
 
-        # Warn at high usage levels (any field >= 80%)
-        is_high = False
-        for key, val in usage_data.items():
-            if isinstance(val, dict):
-                for metric, pct in val.items():
-                    if isinstance(pct, (int, float)) and pct >= 80:
-                        is_high = True
-                        break
+    usage_data = {}
+    if app_usage:
+        try:
+            usage_data["app_usage"] = json.loads(app_usage)
+        except (json.JSONDecodeError, TypeError):
+            usage_data["app_usage_raw"] = str(app_usage)
+    if biz_usage:
+        try:
+            usage_data["business_use_case_usage"] = json.loads(biz_usage)
+        except (json.JSONDecodeError, TypeError):
+            usage_data["business_use_case_usage_raw"] = str(biz_usage)
+    if ad_account_usage:
+        try:
+            usage_data["ad_account_usage"] = json.loads(ad_account_usage)
+        except (json.JSONDecodeError, TypeError):
+            usage_data["ad_account_usage_raw"] = str(ad_account_usage)
 
-        log_fn = logger.warning if is_high else logger.info
-        log_fn(f"meta_rate_limit_usage endpoint={endpoint} {json.dumps(usage_data)}")
+    # Set proactive throttle for any account approaching its rate limit
+    biz_data = usage_data.get("business_use_case_usage", {})
+    if isinstance(biz_data, dict):
+        for acct_id, entries in biz_data.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                pct = max(
+                    entry.get("call_count", 0),
+                    entry.get("total_cputime", 0),
+                    entry.get("total_time", 0),
+                )
+                if isinstance(pct, (int, float)) and pct >= 80:
+                    _account_throttle_until[acct_id] = time.monotonic() + _THROTTLE_DELAY
+                    logger.warning(
+                        f"proactive_throttle account={acct_id} delay={_THROTTLE_DELAY}s "
+                        f"usage={json.dumps(entry)}"
+                    )
+
+    # Warn at high usage levels (any field >= 80%)
+    is_high = any(
+        isinstance(pct, (int, float)) and pct >= 80
+        for val in usage_data.values()
+        if isinstance(val, dict)
+        for pct in val.values()
+    )
+
+    log_fn = logger.warning if is_high else logger.info
+    log_fn(f"meta_rate_limit_usage endpoint={endpoint} {json.dumps(usage_data)}")
 
 
 async def make_api_request(
@@ -104,18 +152,12 @@ async def make_api_request(
     method: str = "GET"
 ) -> Dict[str, Any]:
     """
-    Make a request to the Meta Graph API.
-    
-    Args:
-        endpoint: API endpoint path (without base URL)
-        access_token: Meta API access token
-        params: Additional query parameters
-        method: HTTP method (GET, POST, DELETE)
-    
-    Returns:
-        API response as a dictionary
+    Make a request to the Meta Graph API with retry/backoff for rate-limit errors.
+
+    Rate-limit responses (codes 4, 17, 32, 613 or HTTP 429) are retried up to
+    _MAX_RETRIES times with exponential backoff. Auth errors and malformed-request
+    errors are never retried. Outcome counts are logged after every call.
     """
-    # Validate access token before proceeding
     if not access_token:
         logger.error("API request attempted with blank access token")
         return {
@@ -125,20 +167,14 @@ async def make_api_request(
                 "action_required": "Please authenticate first"
             }
         }
-        
+
     url = f"{META_GRAPH_API_BASE}/{endpoint}"
-    
-    headers = {
-        "User-Agent": USER_AGENT,
-    }
-    
+    headers = {"User-Agent": USER_AGENT}
+
     request_params = params or {}
     request_params["access_token"] = access_token
 
-    # Add appsecret_proof when META_APP_SECRET is configured.
-    # Required for system user tokens and recommended by Meta for all
-    # server-to-server API calls to verify token authenticity.
-    # See: https://developers.facebook.com/docs/graph-api/securing-requests/
+    # appsecret_proof — required for system user tokens
     app_secret = os.environ.get("META_APP_SECRET", "")
     if app_secret and access_token:
         request_params["appsecret_proof"] = hmac.new(
@@ -147,99 +183,107 @@ async def make_api_request(
             hashlib.sha256,
         ).hexdigest()
 
-    # Logging the request (masking token for security)
     masked_params = {k: "***MASKED***" if k in ("access_token", "appsecret_proof") else v for k, v in request_params.items()}
     logger.debug(f"API Request: {method} {url}")
     logger.debug(f"Request params: {masked_params}")
-    
-    # Check for app_id in params
+
     app_id = auth_manager.app_id
     logger.debug(f"Current app_id from auth_manager: {app_id}")
-    
+
+    # Proactive throttle: if this account was flagged as near rate-limit, delay before sending.
+    acct_match = re.search(r'(act_\d+)', endpoint)
+    if acct_match:
+        acct_id = acct_match.group(1)
+        wait_secs = _account_throttle_until.get(acct_id, 0) - time.monotonic()
+        if wait_secs > 0:
+            logger.info(f"proactive_throttle_delay account={acct_id} wait={wait_secs:.1f}s")
+            await asyncio.sleep(wait_secs)
+            _account_throttle_until.pop(acct_id, None)
+
+    # Prepare method-specific params once (mutations are idempotent, safe across retries)
+    if method == "GET":
+        encoded_params: Dict[str, Any] = {
+            k: json.dumps(v) if isinstance(v, (dict, list)) else v
+            for k, v in request_params.items()
+        }
+    elif method == "POST":
+        if 'targeting' in request_params and isinstance(request_params['targeting'], dict):
+            request_params['targeting'] = json.dumps(request_params['targeting'])
+        for key, value in list(request_params.items()):
+            if isinstance(value, (list, dict)):
+                request_params[key] = json.dumps(value)
+        logger.debug(f"POST params (prepared): {masked_params}")
+    elif method == "PUT":
+        put_query_params = {k: request_params[k] for k in ("access_token", "appsecret_proof") if k in request_params}
+        put_body_params = {
+            k: json.dumps(v) if isinstance(v, (list, dict)) else v
+            for k, v in request_params.items()
+            if k not in ("access_token", "appsecret_proof")
+        }
+
+    rate_limited_count = 0
+
     async with httpx.AsyncClient() as client:
-        try:
-            if method == "GET":
-                # For GET, JSON-encode dict/list params (e.g., targeting_spec) to proper strings
-                encoded_params = {}
-                for key, value in request_params.items():
-                    if isinstance(value, (dict, list)):
-                        encoded_params[key] = json.dumps(value)
-                    else:
-                        encoded_params[key] = value
-                response = await client.get(url, params=encoded_params, headers=headers, timeout=30.0)
-            elif method == "POST":
-                # For Meta API, POST requests need data, not JSON
-                if 'targeting' in request_params and isinstance(request_params['targeting'], dict):
-                    # Convert targeting dict to string for the API
-                    request_params['targeting'] = json.dumps(request_params['targeting'])
-                
-                # Convert lists and dicts to JSON strings    
-                for key, value in request_params.items():
-                    if isinstance(value, (list, dict)):
-                        request_params[key] = json.dumps(value)
-                
-                logger.debug(f"POST params (prepared): {masked_params}")
-                response = await client.post(url, data=request_params, headers=headers, timeout=30.0)
-            elif method == "PUT":
-                # PUT for updates that Meta requires via PUT (e.g., creative_features_spec).
-                # Meta expects access_token as a query param, not in the body.
-                query_params = {}
-                body_params = {}
-                for key, value in request_params.items():
-                    if key in ("access_token", "appsecret_proof"):
-                        query_params[key] = value
-                    elif isinstance(value, (list, dict)):
-                        body_params[key] = json.dumps(value)
-                    else:
-                        body_params[key] = value
-                response = await client.put(url, params=query_params, data=body_params, headers=headers, timeout=30.0)
-            elif method == "DELETE":
-                response = await client.delete(url, params=request_params, headers=headers, timeout=30.0)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-            
-            response.raise_for_status()
-            logger.debug(f"API Response status: {response.status_code}")
-
-            # Log Meta rate limit headers for observability
-            _log_meta_rate_limit_headers(response.headers, endpoint)
-
-            # Ensure the response is JSON and return it as a dictionary
+        for attempt in range(_MAX_RETRIES + 1):
             try:
-                return response.json()
-            except json.JSONDecodeError:
-                # If not JSON, return text content in a structured format
-                return {
-                    "text_response": response.text,
-                    "status_code": response.status_code
-                }
-        
-        except httpx.HTTPStatusError as e:
-            error_info = {}
-            try:
-                error_info = e.response.json()
-            except:
-                error_info = {"status_code": e.response.status_code, "text": e.response.text}
-            
-            logger.error(f"HTTP Error: {e.response.status_code} - {error_info}")
+                if method == "GET":
+                    response = await client.get(url, params=encoded_params, headers=headers, timeout=30.0)
+                elif method == "POST":
+                    response = await client.post(url, data=request_params, headers=headers, timeout=30.0)
+                elif method == "PUT":
+                    response = await client.put(url, params=put_query_params, data=put_body_params, headers=headers, timeout=30.0)
+                elif method == "DELETE":
+                    response = await client.delete(url, params=request_params, headers=headers, timeout=30.0)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
 
-            # Log Meta rate limit headers even on errors
-            _log_meta_rate_limit_headers(e.response.headers, endpoint)
+                response.raise_for_status()
+                logger.debug(f"API Response status: {response.status_code}")
+                _log_meta_rate_limit_headers(response.headers, endpoint)
 
-            # Check for rate limit errors vs authentication errors.
-            # Code 4 is a rate limit (NOT auth) — do NOT invalidate token.
-            if "error" in error_info:
-                error_obj = error_info.get("error", {})
-                error_code = error_obj.get("code") if isinstance(error_obj, dict) else None
+                try:
+                    result = response.json()
+                except json.JSONDecodeError:
+                    result = {"text_response": response.text, "status_code": response.status_code}
 
-                if error_code == 4:
-                    # Application-level rate limit — token is still valid
+                outcome = "rate_limited_retried_success" if rate_limited_count > 0 else "success"
+                _record_outcome(outcome)
+                return result
+
+            except httpx.HTTPStatusError as e:
+                error_info: Dict[str, Any] = {}
+                try:
+                    error_info = e.response.json()
+                except Exception:
+                    error_info = {"status_code": e.response.status_code, "text": e.response.text}
+
+                logger.error(f"HTTP Error: {e.response.status_code} - {error_info}")
+                _log_meta_rate_limit_headers(e.response.headers, endpoint)
+
+                error_obj = error_info.get("error", {}) if isinstance(error_info.get("error"), dict) else {}
+                error_code = error_obj.get("code") if error_obj else None
+
+                is_rate_limit = (error_code in _RATE_LIMIT_CODES) or (e.response.status_code == 429)
+
+                if is_rate_limit and attempt < _MAX_RETRIES:
+                    rate_limited_count += 1
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
                     logger.warning(
-                        f"Facebook API rate limit (code=4, subcode={error_obj.get('error_subcode', 'N/A')}, "
-                        f"msg={error_obj.get('error_user_msg', error_obj.get('message', 'N/A'))}). "
-                        f"Token is still valid — NOT invalidating."
+                        f"rate_limit_backoff attempt={attempt + 1}/{_MAX_RETRIES} "
+                        f"delay={delay:.1f}s code={error_code} endpoint={endpoint}"
                     )
-                elif error_code in [190, 102, 200, 10]:
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Not retrying — classify outcome and apply existing error handling
+                if is_rate_limit:
+                    _record_outcome("rate_limited_exhausted")
+                    logger.error(f"rate_limit_exhausted retries={_MAX_RETRIES} endpoint={endpoint}")
+                elif error_code == 100:
+                    _record_outcome("malformed_request")
+                    logger.warning(f"Malformed request (code=100), not retrying: {error_obj.get('message', '')}")
+                elif error_code in [190, 102, 200, 10] or e.response.status_code in [401, 403]:
+                    _record_outcome("auth_error")
                     logger.warning(f"Detected Facebook API auth error: {error_code}")
                     if error_code == 200 and "Provide valid app ID" in error_obj.get("message", ""):
                         logger.error("Meta API authentication configuration issue")
@@ -252,35 +296,32 @@ async def make_api_request(
                             }
                         }
                     auth_manager.invalidate_token()
-                elif e.response.status_code in [401, 403]:
-                    logger.warning(f"Detected authentication error ({e.response.status_code})")
-                    auth_manager.invalidate_token()
-            elif e.response.status_code in [401, 403]:
-                logger.warning(f"Detected authentication error ({e.response.status_code})")
-                auth_manager.invalidate_token()
-            
-            # Include full details for technical users
-            full_response = {
-                "headers": dict(e.response.headers),
-                "status_code": e.response.status_code,
-                "url": str(e.response.url),
-                "reason": getattr(e.response, "reason_phrase", "Unknown reason"),
-                "request_method": e.request.method,
-                "request_url": str(e.request.url)
-            }
-            
-            # Return a properly structured error object
-            return {
-                "error": {
-                    "message": f"HTTP Error: {e.response.status_code}",
-                    "details": error_info,
-                    "full_response": full_response
+                else:
+                    _record_outcome("other_error")
+
+                full_response = {
+                    "headers": dict(e.response.headers),
+                    "status_code": e.response.status_code,
+                    "url": str(e.response.url),
+                    "reason": getattr(e.response, "reason_phrase", "Unknown reason"),
+                    "request_method": e.request.method,
+                    "request_url": str(e.request.url)
                 }
-            }
-        
-        except Exception as e:
-            logger.error(f"Request Error: {str(e)}")
-            return {"error": {"message": str(e)}}
+                return {
+                    "error": {
+                        "message": f"HTTP Error: {e.response.status_code}",
+                        "details": error_info,
+                        "full_response": full_response
+                    }
+                }
+
+            except Exception as e:
+                logger.error(f"Request Error: {str(e)}")
+                _record_outcome("other_error")
+                return {"error": {"message": str(e)}}
+
+    # Unreachable — loop always returns — but satisfies type checker
+    return {"error": {"message": "Unexpected: retry loop exhausted"}}
 
 
 # Generic wrapper for all Meta API tools

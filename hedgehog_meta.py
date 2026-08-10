@@ -10,15 +10,20 @@ Required env vars:
   MCP_API_KEY         — Bearer token for clients connecting to this server
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
 from fastmcp import FastMCP
+
+_logger = logging.getLogger(__name__)
 
 # ── Server setup ─────────────────────────────────────────────────────────────
 
@@ -26,6 +31,11 @@ mcp = FastMCP("hedgehog-meta")
 
 GRAPH_VERSION = os.getenv("GRAPH_VERSION", "v24.0")
 META_GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_VERSION}"
+
+# Rate-limit error codes — retry with exponential backoff on these
+_RATE_LIMIT_CODES = frozenset({4, 17, 32, 613})
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 2.0  # seconds; doubles per attempt
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -53,47 +63,108 @@ def _encode_params(params: dict) -> dict:
 
 
 async def _meta_get(endpoint: str, params: Optional[dict] = None) -> dict:
-    """GET {GRAPH_BASE}/{endpoint} with auth + appsecret_proof injected."""
+    """GET {GRAPH_BASE}/{endpoint} with auth + appsecret_proof injected.
+
+    Rate-limit responses (codes 4, 17, 32, 613 or HTTP 429) are retried up to
+    _MAX_RETRIES times with exponential backoff + jitter.
+    """
     token = _token()
     p = dict(params or {})
     p["access_token"] = token
     proof = _appsecret_proof(token)
     if proof:
         p["appsecret_proof"] = proof
+    encoded = _encode_params(p)
+
+    last_result: dict = {}
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{META_GRAPH_BASE}/{endpoint}",
-            params=_encode_params(p),
-            timeout=30.0,
-        )
-    try:
-        return r.json()
-    except Exception:
-        return {"error": {"message": r.text, "status_code": r.status_code}}
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                r = await client.get(
+                    f"{META_GRAPH_BASE}/{endpoint}",
+                    params=encoded,
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                return {"error": {"message": str(exc), "status_code": 0}}
+            try:
+                result = r.json()
+            except Exception:
+                return {"error": {"message": r.text, "status_code": r.status_code}}
+
+            error = result.get("error", {}) if isinstance(result, dict) else {}
+            error_code = error.get("code") if isinstance(error, dict) else None
+            is_rate_limit = (error_code in _RATE_LIMIT_CODES) or (r.status_code == 429)
+
+            if is_rate_limit and attempt < _MAX_RETRIES:
+                delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                _logger.warning(
+                    f"meta_get rate_limit_backoff attempt={attempt + 1}/{_MAX_RETRIES} "
+                    f"delay={delay:.1f}s code={error_code} endpoint={endpoint}"
+                )
+                await asyncio.sleep(delay)
+                last_result = result
+                continue
+
+            if is_rate_limit:
+                _logger.error(f"meta_get rate_limit_exhausted retries={_MAX_RETRIES} endpoint={endpoint}")
+            return result
+
+    return last_result
 
 
 async def _meta_post(endpoint: str, data: Optional[dict] = None) -> dict:
-    """POST {GRAPH_BASE}/{endpoint} with auth + appsecret_proof injected."""
+    """POST {GRAPH_BASE}/{endpoint} with auth + appsecret_proof injected.
+
+    Rate-limit responses (codes 4, 17, 32, 613 or HTTP 429) are retried up to
+    _MAX_RETRIES times with exponential backoff + jitter.
+    """
     token = _token()
     d = dict(data or {})
     d["access_token"] = token
     proof = _appsecret_proof(token)
     if proof:
         d["appsecret_proof"] = proof
-    # Meta POST expects form data; encode dicts/lists to JSON strings
+    # Encode dicts/lists to JSON strings once (idempotent — safe across retries)
     for k, v in list(d.items()):
         if isinstance(v, (dict, list)):
             d[k] = json.dumps(v)
+
+    last_result: dict = {}
     async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{META_GRAPH_BASE}/{endpoint}",
-            data=d,
-            timeout=30.0,
-        )
-    try:
-        return r.json()
-    except Exception:
-        return {"error": {"message": r.text, "status_code": r.status_code}}
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                r = await client.post(
+                    f"{META_GRAPH_BASE}/{endpoint}",
+                    data=d,
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                return {"error": {"message": str(exc), "status_code": 0}}
+            try:
+                result = r.json()
+            except Exception:
+                return {"error": {"message": r.text, "status_code": r.status_code}}
+
+            error = result.get("error", {}) if isinstance(result, dict) else {}
+            error_code = error.get("code") if isinstance(error, dict) else None
+            is_rate_limit = (error_code in _RATE_LIMIT_CODES) or (r.status_code == 429)
+
+            if is_rate_limit and attempt < _MAX_RETRIES:
+                delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                _logger.warning(
+                    f"meta_post rate_limit_backoff attempt={attempt + 1}/{_MAX_RETRIES} "
+                    f"delay={delay:.1f}s code={error_code} endpoint={endpoint}"
+                )
+                await asyncio.sleep(delay)
+                last_result = result
+                continue
+
+            if is_rate_limit:
+                _logger.error(f"meta_post rate_limit_exhausted retries={_MAX_RETRIES} endpoint={endpoint}")
+            return result
+
+    return last_result
 
 
 def _ensure_act(account_id: str) -> str:
