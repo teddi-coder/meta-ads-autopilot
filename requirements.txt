@@ -1,5 +1,8 @@
 httpx>=0.26.0
 mcp[cli]==1.12.2
+# mcp 1.12.2 imports pydantic._internal._typing_extra.eval_type_backport, removed in pydantic 2.14.
+# Unpinned pydantic broke the 11 Nov 2026 Fly deploy (v24). Keep this cap until mcp is upgraded.
+pydantic>=2.11,<2.14
 python-dotenv>=1.1.0
 requests>=2.32.3
 Pillow>=10.0.0
