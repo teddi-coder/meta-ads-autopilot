@@ -22,6 +22,8 @@ class APIKeyAuthMiddleware:
             # Check Bearer token header
             headers = dict(scope.get("headers", []))
             auth = headers.get(b"authorization", b"").decode()
+            # Check X-API-Key header (claude.ai connectors can't set Authorization)
+            x_api_key = headers.get(b"x-api-key", b"").decode()
             # Check ?key= query param
             qs = scope.get("query_string", b"").decode()
             key_param = ""
@@ -29,7 +31,11 @@ class APIKeyAuthMiddleware:
                 if part.startswith("key="):
                     key_param = part[4:]
                     break
-            if auth != f"Bearer {self.api_key}" and key_param != self.api_key:
+            if (
+                auth != f"Bearer {self.api_key}"
+                and x_api_key != self.api_key
+                and key_param != self.api_key
+            ):
                 resp = Response("Unauthorized", status_code=401)
                 await resp(scope, receive, send)
                 return
